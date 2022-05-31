@@ -23,6 +23,9 @@
  */
 
 import org.apache.zookeeper.*;
+import org.apache.zookeeper.data.Stat;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -36,41 +39,58 @@ public class LeaderElection implements Watcher {
     private static final String ZOOKEEPER_ADDRESS = "localhost:2181";
     private static final int SESSION_TIMEOUT = 3000;
     private static final String ELECTION_NAMESPACE = "/election";
+    private static final String TARGET_ZNODE = "/target_znode";
     private ZooKeeper zooKeeper;
     private String currentZnodeName;
+    static Logger logger = LoggerFactory.getLogger(LeaderElection.class);
 
     // NOTE - Don't forget to create the /election ZNode
     public static void main(String[] arg) throws IOException, InterruptedException, KeeperException {
         LeaderElection leaderElection = new LeaderElection();
-
         leaderElection.connectToZookeeper();
         leaderElection.volunteerForLeadership();
-        leaderElection.electLeader();
+        leaderElection.reelectLeader();
         leaderElection.run();
         leaderElection.close();
-        System.out.println("Disconnected from Zookeeper, exiting application");
+        logger.info("Disconnected from Zookeeper, exiting application");
+    }
+
+    public void watchTargetZnode() throws InterruptedException, KeeperException {
+        Stat stat = zooKeeper.exists(TARGET_ZNODE,this);
+        if(stat == null){
+            return;
+        }
+        byte[] data = zooKeeper.getData(TARGET_ZNODE,this,stat);
+        List<String> children = zooKeeper.getChildren(TARGET_ZNODE,this);
+        logger.info("Data:{} children: {}",data.toString(),children.toString());
     }
 
     public void volunteerForLeadership() throws KeeperException, InterruptedException {
         String znodePrefix = ELECTION_NAMESPACE + "/c_";
         String znodeFullPath = zooKeeper.create(znodePrefix, new byte[]{}, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
-
-        System.out.println("znode name " + znodeFullPath);
+        logger.info("znode name " + znodeFullPath);
         this.currentZnodeName = znodeFullPath.replace("/election/", "");
     }
 
-    public void electLeader() throws KeeperException, InterruptedException {
+    public void reelectLeader() throws KeeperException, InterruptedException {
         List<String> children = zooKeeper.getChildren(ELECTION_NAMESPACE, false);
-
         Collections.sort(children);
         String smallestChild = children.get(0);
 
         if (smallestChild.equals(currentZnodeName)) {
-            System.out.println("I am the leader");
+            logger.info("I am the leader");
             return;
+        } else{
+            Stat predecessorStat = null;
+            String predecessorName = "";
+            logger.info("I am not the leader, " + smallestChild + " is the leader");
+            while (predecessorStat == null){
+                int predecessorIndex = Collections.binarySearch(children,currentZnodeName) - 1;
+                predecessorName = children.get(predecessorIndex);
+                predecessorStat = zooKeeper.exists(ELECTION_NAMESPACE+"/"+predecessorName,this);
+            }
+            logger.info("I follow to {}",predecessorName);
         }
-
-        System.out.println("I am not the leader, " + smallestChild + " is the leader");
     }
 
     public void connectToZookeeper() throws IOException {
@@ -92,13 +112,30 @@ public class LeaderElection implements Watcher {
         switch (event.getType()) {
             case None:
                 if (event.getState() == Event.KeeperState.SyncConnected) {
-                    System.out.println("Successfully connected to Zookeeper");
+                    logger.info("Successfully connected to Zookeeper");
                 } else {
                     synchronized (zooKeeper) {
-                        System.out.println("Disconnected from Zookeeper event");
+                        logger.info("Disconnected from Zookeeper event");
                         zooKeeper.notifyAll();
                     }
                 }
+                break;
+            case NodeDeleted:
+                try {
+                    this.reelectLeader();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                break;
+            case NodeCreated:
+                logger.info("{} was created",TARGET_ZNODE);
+                break;
+            case NodeDataChanged:
+                logger.info("{} data changed",TARGET_ZNODE);
+                break;
+            case NodeChildrenChanged:
+                logger.info("{} children changed",TARGET_ZNODE);
+                break;
         }
     }
 }
